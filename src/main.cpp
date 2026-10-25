@@ -1,12 +1,11 @@
-// ScooterGuard firmware - ESP32-S3 N16R8
-// Ultrasonic 1-10 threat meter + IMU driver score, on an SSD1306 OLED, LEDs and buzzer.
-// Runs fully standalone. Rides are detected from motion, checkpointed to flash, and handed to a
+// ScooterGuard firmware - rear unit, ESP32-S3 N16R8
+// Ultrasonic 1-10 threat meter + IMU driver score, with a brake light and left/right indicators.
+// The brake light comes on when the IMU sees braking and flashes when a car closes in from behind.
+// Indicators are switched by the SIG command (RideLink.h). Runs fully standalone. Rides are detected from motion, checkpointed to flash, and handed to a
 // carrier (phone over BLE, or a script over USB Serial) with the commands in RideLink.h.
 // Serial also prints live JSON lines (events + ride metrics).
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <Preferences.h>
 #include "ThreatMeter.h"
 #include "Imu6500.h"
@@ -17,17 +16,19 @@
 #include "RideLink.h"
 
 // ---- Pins (ESP32-S3 N16R8: avoid 0,3,45,46 strapping, 19/20 USB, 26-37 flash/PSRAM) ----
-constexpr int TRIG_PIN = 4, ECHO_PIN = 5;             // ECHO needs a 1k/2k divider (5V sensor)
-constexpr int LED_GREEN = 15, LED_YELLOW = 16, LED_RED = 17, BUZZER_PIN = 18;
-constexpr int BUTTON_PIN = 14;                        // to GND. Tap = switch page, hold 3 s = recalibrate
-constexpr int SDA_PIN = 8, SCL_PIN = 9;               // OLED (0x3C) and IMU (0x68) share this bus
+constexpr int TRIG_PIN = 6, ECHO_PIN = 7;             // ECHO needs a voltage divider (5V sensor)
+constexpr int LED_LEFT = 4, LED_RIGHT = 5, LED_BRAKE = 8;   // each through 330R to GND
+constexpr int SDA_PIN = 15, SCL_PIN = 16;             // IMU (0x68 or 0x69)
 
 #define REPORT_EVERY_MS 10000UL
 #define CHECKPOINT_MS 30000UL                         // save the ride in progress this often
 #define MIN_RIDE_S 60.0f                              // less moving time than this isn't kept as a ride
 #define DEBUG_PLOT 0                                  // 1 = print brake/lat/level for Serial Plotter
+#define BRAKE_ON_G 0.10f                              // brake light on above this deceleration...
+#define BRAKE_OFF_G 0.06f                             // ...off below this
+#define BRAKE_HOLD_MS 500UL                           // and stays on at least this long
+#define BLINK_MS 400UL                                // indicator on/off time (~1.25 Hz)
 
-Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Imu6500 imu;
 DriveMotion motion;
 SafetyTracker safety;
@@ -42,12 +43,14 @@ double epochAtBoot = 0;                               // set by the TIME command
 String serialLine;
 
 enum Mode { CAL_REST, CAL_PUSH, RUN, IMU_FAIL };
-Mode mode = CAL_REST;
-int page = 0, imuFails = 0, calN = 0;
+Mode mode = CAL_REST, shownMode = IMU_FAIL;           // shownMode != mode makes the first status print
+enum Indicator { IND_OFF, IND_LEFT, IND_RIGHT, IND_HAZARD };
+Indicator indicator = IND_OFF;
+int imuFails = 0, calN = 0;
 Vec3 sumA = {0, 0, 0}, sumW = {0, 0, 0};
 float amin = 9, amax = 0;
-unsigned long lastSense = 0, lastImuUs = 0, lastDisp = 0, lastBlink = 0, lastReport = 0, lastCheckpoint = 0, btnT = 0;
-bool blinkOn = false, btnDown = false, longDone = false;
+unsigned long lastSense = 0, lastImuUs = 0, lastBlink = 0, lastReport = 0, lastCheckpoint = 0, brakeT = 0, restartAt = 0;
+bool blinkOn = false, braking = false;
 
 // ---- non-blocking ultrasonic (interrupt on echo edges, so the 100 Hz IMU loop never stalls) ----
 volatile uint32_t echoRise = 0, echoUs = 0;
@@ -170,6 +173,20 @@ void handleCommand(String line, bool fromBle) {
     bool ok = t > 1.6e9;
     if (ok) epochAtBoot = t - millis() / 1000.0;
     out = String("{\"resp\":\"time\",\"ok\":") + (ok ? "true" : "false") + "}";
+  } else if (cmd == "SIG") {
+    arg.toUpperCase();
+    bool ok = true;
+    if (arg == "L") indicator = IND_LEFT;
+    else if (arg == "R") indicator = IND_RIGHT;
+    else if (arg == "H") indicator = IND_HAZARD;
+    else if (arg == "OFF") indicator = IND_OFF;
+    else ok = false;
+    out = String("{\"resp\":\"sig\",\"ok\":") + (ok ? "true" : "false") + "}";
+  } else if (cmd == "RECAL") {                          // forget the forward axis and relearn it
+    if (rides.active()) endRide();
+    prefs.remove("fwd");
+    restartAt = millis() + 500;                         // give the reply time to go out
+    out = "{\"resp\":\"recal\",\"ok\":true}";
   } else {
     out = "{\"resp\":\"error\",\"error\":\"unknown command\"}";
   }
@@ -197,78 +214,42 @@ void report() {
                 m.moving_s, r.score, m.brakeBase_s, m.brakeHard_s, m.turnBase_s, m.turnHard_s, m.proxBase_s, m.proxHigh_s);
 }
 
-// ---- outputs ----
-void updateOutputs() {
-  int lvl = meter.level();
-  unsigned long now = millis(), period = lvl >= 9 ? 100 : lvl >= 7 ? 300 : 0;
-  if (period && now - lastBlink >= period) { blinkOn = !blinkOn; lastBlink = now; }
-  if (!period) blinkOn = true;
-  digitalWrite(LED_GREEN, lvl <= 3);
-  digitalWrite(LED_YELLOW, lvl >= 4 && lvl <= 6);
-  digitalWrite(LED_RED, lvl >= 7 && blinkOn);
-  digitalWrite(BUZZER_PIN, lvl >= 7 && blinkOn);
-}
+// ---- lights ----
+const char *modeName(Mode m) { return m == CAL_REST ? "cal_rest" : m == CAL_PUSH ? "cal_push" : m == RUN ? "run" : "imu_fail"; }
 
-void drawThreat() {
-  int lvl = meter.level();
-  display.setTextSize(1); display.setCursor(0, 0); display.print(ThreatMeter::label(lvl));
-  if (mode == RUN) { display.setCursor(86, 0); display.print("DS "); display.print(computeScore(safety.m).score); }
-  display.setTextSize(4); display.setCursor(0, 14); display.print(lvl);
-  display.setTextSize(1);
-  display.setCursor(66, 16);
-  if (meter.distanceCm() >= 400) display.print("-- cm"); else { display.print((int)meter.distanceCm()); display.print(" cm"); }
-  display.setCursor(66, 28); display.print(meter.closingMps() > 0 ? meter.closingMps() : 0, 1); display.print(" m/s");
-  display.setCursor(66, 40); display.print("TTC ");
-  if (meter.ttcSec() > 0) { display.print(meter.ttcSec(), 1); display.print("s"); } else display.print("--");
-  for (int i = 0; i < 10; i++) {
-    int x = i * 12 + 4;
-    if (i < lvl) display.fillRect(x, 54, 10, 9, SSD1306_WHITE); else display.drawRect(x, 54, 10, 9, SSD1306_WHITE);
-  }
-}
-
-void drawDrive() {
-  ScoreResult r = computeScore(safety.m);
-  const char *lab = r.score >= 90 ? "EXCELLENT" : r.score >= 80 ? "GOOD" : r.score >= 65 ? "FAIR" : "NEEDS WORK";
-  display.setTextSize(1); display.setCursor(0, 0); display.print("DRIVER SCORE");
-  if (rides.active()) { display.setCursor(110, 0); display.print("REC"); }
-  display.setTextSize(3); display.setCursor(0, 14); display.print(r.score);
-  display.setTextSize(1); display.setCursor(66, 18); display.print(lab);
-  display.setCursor(66, 30); display.printf("Ride %d:%02d", (int)safety.m.moving_s / 60, (int)safety.m.moving_s % 60);
-  display.setCursor(0, 42); display.printf("BRK %.1f%%  TRN %.1f%%", r.fBrake, r.fTurn);
-  display.setCursor(0, 54); display.printf("PRX %.1f%%  %.2fg/%.2fg", r.fProx, motion.brakeG(), motion.lateralG());
-}
-
-void drawMsg(const char *a, const char *b, const char *c) {
-  display.setTextSize(2); display.setCursor(0, 6); display.print(a);
-  display.setTextSize(1); display.setCursor(0, 32); display.print(b); display.setCursor(0, 44); display.print(c);
-}
-
-void updateDisplay() {
-  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
-  if (meter.level() >= 7) drawThreat();                   // danger always wins the screen
-  else if (mode == CAL_REST) { drawMsg("HOLD STILL", "Calibrating sensor...", "Keep scooter upright"); display.fillRect(0, 58, calN * 128 / 200, 5, SSD1306_WHITE); }
-  else if (mode == CAL_PUSH) drawMsg("PUSH FWD", "Roll it forward gently", "(one-time setup)");
-  else if (mode == IMU_FAIL) { drawThreat(); display.setCursor(86, 0); display.print("NO IMU"); }
-  else if (page == 0) drawThreat();
-  else drawDrive();
-  display.display();
-}
-
-void handleButton() {
-  bool down = digitalRead(BUTTON_PIN) == LOW;
+void updateLights() {
   unsigned long now = millis();
-  if (down && !btnDown) { btnDown = true; btnT = now; longDone = false; }
-  if (down && !longDone && now - btnT > 3000) { longDone = true; if (rides.active()) endRide(); prefs.remove("fwd"); ESP.restart(); }
-  if (!down && btnDown) { btnDown = false; if (!longDone && now - btnT > 30) page ^= 1; }
+  if (now - lastBlink >= BLINK_MS) { blinkOn = !blinkOn; lastBlink = now; }
+  if (mode != shownMode) { shownMode = mode; Serial.printf("{\"status\":\"%s\"}\n", modeName(mode)); }
+
+  // Indicators. With no screen, calibration shows here too:
+  // both solid = hold still, both blinking = push it forward (one-time), alternating = no IMU.
+  bool left, right;
+  if (mode == CAL_REST) left = right = true;
+  else if (mode == CAL_PUSH) left = right = blinkOn;
+  else if (mode == IMU_FAIL) { left = blinkOn; right = !blinkOn; }
+  else {
+    left = (indicator == IND_LEFT || indicator == IND_HAZARD) && blinkOn;
+    right = (indicator == IND_RIGHT || indicator == IND_HAZARD) && blinkOn;
+  }
+  digitalWrite(LED_LEFT, left);
+  digitalWrite(LED_RIGHT, right);
+
+  // Brake light: on while braking, flashing when a car is closing in (threat 7+), faster at 9+.
+  float g = mode == RUN ? motion.brakeG() : 0;
+  if (g >= BRAKE_ON_G) { braking = true; brakeT = now; }
+  else if (braking && g < BRAKE_OFF_G && now - brakeT >= BRAKE_HOLD_MS) braking = false;
+  int lvl = meter.level();
+  unsigned long period = lvl >= 9 ? 100 : lvl >= 7 ? 250 : 0;
+  digitalWrite(LED_BRAKE, period ? (now / period) % 2 == 0 : braking);
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT); pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(LED_GREEN, OUTPUT); pinMode(LED_YELLOW, OUTPUT); pinMode(LED_RED, OUTPUT); pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_LEFT, OUTPUT); pinMode(LED_RIGHT, OUTPUT); pinMode(LED_BRAKE, OUTPUT);
   attachInterrupt(digitalPinToInterrupt(ECHO_PIN), echoIsr, CHANGE);
   Wire.begin(SDA_PIN, SCL_PIN); Wire.setClock(400000);
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   prefs.begin("sg", false);
   if (!store.begin()) Serial.println("{\"error\":\"flash mount failed\"}");
   ble.begin("ScooterGuard");
@@ -295,6 +276,6 @@ void loop() {
     fireTrigger();
   }
   if (mode == RUN && now - lastReport >= REPORT_EVERY_MS) { lastReport = now; report(); }
-  updateOutputs(); handleButton(); pollCommands();
-  if (now - lastDisp >= 100) { lastDisp = now; updateDisplay(); }
+  updateLights(); pollCommands();
+  if (restartAt && (long)(now - restartAt) >= 0) ESP.restart();
 }

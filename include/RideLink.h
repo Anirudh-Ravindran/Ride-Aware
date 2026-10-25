@@ -8,6 +8,8 @@
 //   GET <id>      {"resp":"ride","id":3,"ride":{...POST /api/rides body...}}
 //   DEL <id>      {"resp":"del","id":3,"ok":true}    send only after the server answered 201
 //   TIME <unix>   {"resp":"time","ok":true}          UTC seconds; rides started after this carry startedAt
+//   SIG L|R|H|OFF {"resp":"sig","ok":true}           indicators: left, right, hazard, off
+//   RECAL         {"resp":"recal","ok":true}         forget the forward axis and restart to relearn it
 //
 // Carrier loop: TIME now -> LIST -> for each id: GET, add GPS fields, POST /api/rides, on 201 DEL.
 // The commands themselves are handled in main.cpp.
